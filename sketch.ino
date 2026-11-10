@@ -1,197 +1,205 @@
 
-// Automatic watering controller
-// Manual switch A1 simulates BOTH tank checks.
-// Switch closed = water available.
-// Switch open = tank empty.
-// Pump operates only when both simulated checks report water.
+const int SOIL_PIN = A0;
+const int TANK_SWITCH_PIN = A1;
+const int RELAY_PIN = 8;
+const int BUZZER_PIN = 9;
+const int GREEN_LED_PIN = 10;
+const int RED_LED_PIN = 11;
 
-const uint8_t SOIL_PIN = A0;
-const uint8_t TANK_SWITCH_PIN = A1;
-const uint8_t TANK_LEVEL_PIN = A2; // Reserved; not used in simulation mode
-const uint8_t RELAY_PIN = 8;
-const uint8_t BUZZER_PIN = 9;
-const uint8_t GREEN_LED_PIN = 10;
-const uint8_t RED_LED_PIN = 11;
+const bool RELAY_ACTIVE_LOW = true;
 
-const int SOIL_DRY_THRESHOLD = 600;
+const int SOIL_DRY_THRESHOLD = 550;
+const int SOIL_WET_THRESHOLD = 500;
+const int SOIL_FAULT_LOW = 5;
 
-const unsigned long SWITCH_DEBOUNCE_MS = 30;
-const unsigned long SOIL_SAMPLE_MS = 1000;
-const unsigned long MAX_WATER_MS = 5000;
-const unsigned long REWATER_DELAY_MS = 30000;
+const unsigned long MAX_WATER_MS = 10000;
+const unsigned long REWATER_DELAY_MS = 5000;
+const unsigned long SAMPLE_MS = 1000;
+const unsigned long BEEP_MS = 300;
 
-// Active-low relay
-const uint8_t RELAY_ON = LOW;
-const uint8_t RELAY_OFF = HIGH;
-
-// Alarm melody
-const int MELODY_NOTES[] = {
-  659,622,659,622,659,494,587,523,440,0,
-  262,330,440,494,0,
-  330,415,494,523,0
+const int MELODY[] = {
+  659, 622, 659, 622, 659, 494, 587, 523, 440, 0,
+  262, 330, 440, 494, 0,
+  330, 415, 494, 523, 0
 };
 
-const unsigned int MELODY_MS[] = {
-  200,200,200,200,200,200,200,200,600,300,
-  200,200,200,600,300,
-  200,200,200,600,300
+const int NOTE_TIME[] = {
+  200, 200, 200, 200, 200, 200, 200, 200, 600, 300,
+  200, 200, 200, 600, 300,
+  200, 200, 200, 600, 300
 };
 
-const uint8_t MELODY_LEN =
-  sizeof(MELODY_NOTES) / sizeof(MELODY_NOTES[0]);
+const int MELODY_LENGTH = 19;
 
-uint8_t melodyIndex = 0;
-unsigned long melodyNoteStart = 0;
-
-void playCurrentNote() {
-  if (MELODY_NOTES[melodyIndex] == 0) {
-    noTone(BUZZER_PIN);
-  } else {
-    tone(BUZZER_PIN, MELODY_NOTES[melodyIndex]);
-  }
-}
-
-void startMelody(unsigned long now) {
-  melodyIndex = 0;
-  melodyNoteStart = now;
-  playCurrentNote();
-}
-
-void updateMelody(unsigned long now) {
-  if (now - melodyNoteStart >= MELODY_MS[melodyIndex]) {
-    melodyIndex = (melodyIndex + 1) % MELODY_LEN;
-    melodyNoteStart = now;
-    playCurrentNote();
-  }
-}
-
-// System states
-bool switchCandidate = false;
-bool switchHasWater = false;
-bool soilIsDry = false;
+bool soilDry = false;
+bool tankHasWater = false;
+bool soilFault = false;
 bool pumpRunning = false;
 bool hasWatered = false;
 bool alarmActive = false;
 
-unsigned long switchCandidateSince = 0;
-unsigned long lastSoilSample = 0;
-unsigned long pumpStartedAt = 0;
-unsigned long lastWateredAt = 0;
+int soilRaw = 0;
 
-void pumpOff() {
-  digitalWrite(RELAY_PIN, RELAY_OFF);
-  pumpRunning = false;
+unsigned long pumpStart = 0;
+unsigned long lastWatered = 0;
+unsigned long lastSample = 0;
+unsigned long lastStatus = 0;
+unsigned long lastBeep = 0;
+unsigned long noteStart = 0;
+
+int melodyIndex = 0;
+bool beepState = false;
+
+void motor(bool state) {
+
+  if (pumpRunning == state) return;
+
+  digitalWrite(RELAY_PIN,
+    RELAY_ACTIVE_LOW ? (state ? LOW : HIGH) : (state ? HIGH : LOW));
+
+  pumpRunning = state;
+
+  if (state) {
+    pumpStart = millis();
+    Serial.println("MOTOR ON");
+  } else {
+    Serial.println("MOTOR OFF");
+  }
+}
+
+void stopAlarm() {
+  noTone(BUZZER_PIN);
+  alarmActive = false;
+  beepState = false;
+}
+
+void updateAlarm(unsigned long now) {
+
+  if (!alarmActive) {
+    alarmActive = true;
+    melodyIndex = 0;
+    noteStart = now;
+    tone(BUZZER_PIN, MELODY[0]);
+  }
+
+  if (now - noteStart >= NOTE_TIME[melodyIndex]) {
+    melodyIndex = (melodyIndex + 1) % MELODY_LENGTH;
+    noteStart = now;
+
+    if (MELODY[melodyIndex] == 0) {
+      noTone(BUZZER_PIN);
+    } else {
+      tone(BUZZER_PIN, MELODY[melodyIndex]);
+    }
+  }
+}
+
+void readSensors() {
+
+  soilRaw = analogRead(SOIL_PIN);
+
+  tankHasWater = (digitalRead(TANK_SWITCH_PIN) == LOW);
+
+  soilFault = (soilRaw <= SOIL_FAULT_LOW);
+
+  if (soilRaw >= SOIL_DRY_THRESHOLD) {
+    soilDry = true;
+  }
+
+  if (soilRaw <= SOIL_WET_THRESHOLD) {
+    soilDry = false;
+  }
 }
 
 void setup() {
+
+  Serial.begin(9600);
+
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(TANK_SWITCH_PIN, INPUT_PULLUP);
+
   pinMode(RELAY_PIN, OUTPUT);
-  pumpOff();
-
   pinMode(BUZZER_PIN, OUTPUT);
-  noTone(BUZZER_PIN);
-
   pinMode(GREEN_LED_PIN, OUTPUT);
   pinMode(RED_LED_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
 
   digitalWrite(GREEN_LED_PIN, LOW);
   digitalWrite(RED_LED_PIN, LOW);
 
-  pinMode(TANK_SWITCH_PIN, INPUT_PULLUP);
+  noTone(BUZZER_PIN);
 
-  switchCandidate = (digitalRead(TANK_SWITCH_PIN) == LOW);
-  switchCandidateSince = millis();
+  readSensors();
 
-  Serial.begin(9600);
+  lastSample = millis();
+  lastStatus = millis();
+
+  Serial.println("WATERING SYSTEM STARTED");
 }
 
 void loop() {
-  const unsigned long now = millis();
 
-  // Debounce manual tank switch.
-  // LOW = water available.
-  // HIGH = tank empty.
+  unsigned long now = millis();
 
-  const bool rawSwitchHasWater =
-    (digitalRead(TANK_SWITCH_PIN) == LOW);
-
-  if (rawSwitchHasWater != switchCandidate) {
-    switchCandidate = rawSwitchHasWater;
-    switchCandidateSince = now;
+  if (now - lastSample >= SAMPLE_MS) {
+    lastSample = now;
+    readSensors();
   }
 
-  if (now - switchCandidateSince >= SWITCH_DEBOUNCE_MS) {
-    switchHasWater = switchCandidate;
-  }
+  if (!tankHasWater) {
 
-  // Soil moisture sampling.
-  if (now - lastSoilSample >= SOIL_SAMPLE_MS) {
-    lastSoilSample = now;
-
-    soilIsDry =
-      (analogRead(SOIL_PIN) >= SOIL_DRY_THRESHOLD);
-
-    Serial.print("Soil dry: ");
-    Serial.print(soilIsDry ? "yes" : "no");
-
-    Serial.print("  Switch wet: ");
-    Serial.print(switchHasWater ? "yes" : "no");
-
-    Serial.print("  Simulated float wet: ");
-    Serial.println(switchHasWater ? "yes" : "no");
-  }
-
-  // Manual switch simulates both tank checks.
-  const bool simulatedFloatSwitchHasWater = switchHasWater;
-
-  const bool tankChecksAgreeWet =
-    switchHasWater && simulatedFloatSwitchHasWater;
-
-  // Tank empty: stop pump and activate alarm.
-  if (!tankChecksAgreeWet) {
-    pumpOff();
-    hasWatered = false;
+    motor(false);
 
     digitalWrite(GREEN_LED_PIN, LOW);
     digitalWrite(RED_LED_PIN, HIGH);
 
-    if (!alarmActive) {
-      startMelody(now);
-      alarmActive = true;
-    }
+    updateAlarm(now);
 
-    updateMelody(now);
-    return;
-  }
+  } else {
 
-  // Tank has water: stop alarm.
-  if (alarmActive) {
-    noTone(BUZZER_PIN);
-    alarmActive = false;
-  }
+    stopAlarm();
 
-  digitalWrite(RED_LED_PIN, LOW);
-  digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(RED_LED_PIN, LOW);
 
-  // Soil is wet: no watering needed.
-  if (!soilIsDry) {
-    pumpOff();
-    hasWatered = false;
-    return;
-  }
+    if (soilFault || !soilDry) {
 
-  // Bounded watering cycle.
-  if (pumpRunning) {
-    if (now - pumpStartedAt >= MAX_WATER_MS) {
-      pumpOff();
-      lastWateredAt = now;
-      hasWatered = true;
+      motor(false);
+      hasWatered = false;
+
+    } else {
+
+      if (pumpRunning) {
+
+        if (now - pumpStart >= MAX_WATER_MS) {
+          motor(false);
+          lastWatered = now;
+          hasWatered = true;
+        }
+
+      } else if (!hasWatered ||
+                 now - lastWatered >= REWATER_DELAY_MS) {
+
+        motor(true);
+      }
     }
   }
-  else if (!hasWatered ||
-           now - lastWateredAt >= REWATER_DELAY_MS) {
 
-    digitalWrite(RELAY_PIN, RELAY_ON);
-    pumpRunning = true;
-    pumpStartedAt = now;
+  if (now - lastStatus >= 1000) {
+
+    lastStatus = now;
+
+    Serial.print("Soil Value: ");
+    Serial.print(soilRaw);
+
+    Serial.print(" | Soil: ");
+    Serial.print(soilFault ? "FAULT" : soilDry ? "DRY" : "WET");
+
+    Serial.print(" | Tank: ");
+    Serial.print(tankHasWater ? "FULL" : "EMPTY");
+
+    Serial.print(" | Motor: ");
+    Serial.println(pumpRunning ? "ON" : "OFF");
   }
 }
